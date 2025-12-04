@@ -1,0 +1,14 @@
+# Ignore Data
+data/
+data_augmented/
+
+# Ignore Experiments/Models
+experiments/
+*.pth
+*.wav
+
+# Ignore Python Cache
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+.DS_Store
