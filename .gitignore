@@ -1,6 +1,6 @@
 # Ignore Data
 data/
-data_augmented/
+raw_data/
 
 # Ignore Experiments/Models
 experiments/
@@ -12,3 +12,4 @@ __pycache__/
 *.pyc
 .ipynb_checkpoints/
 .DS_Store
+*.pt
