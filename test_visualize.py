@@ -26,7 +26,7 @@ def main():
     # 加载模型
     print("正在加载模型...")
     model = DogEmotionModel()
-    model.load_state_dict(torch.load("best_dog_model.pt", map_location=device))
+    model.load_state_dict(torch.load("best_emergent_vad.pt", map_location=device))
     model.to(device)
     model.eval()
 
