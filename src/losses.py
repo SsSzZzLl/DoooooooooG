@@ -6,74 +6,66 @@
 # @Software : PyCharm
 # @Description : 
 
-# src/losses.py —— 终极正确版 EmergentVADLoss（严格按你的公式）
+# src/losses.py
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-
 class BiProtoAlignLoss(nn.Module):
-    def __init__(self, temp=0.07):
+    def __init__(self):
         super().__init__()
-        self.temp = temp
 
-    def forward(self, emb, labels, human_anchors, dog_protos):
-        logits = torch.matmul(emb, human_anchors.T) / self.temp
+    def forward(self, emb, labels, human_anchors, dog_protos, temp=0.07):
+        logits = torch.matmul(emb, human_anchors.T) / temp
         loss_a = F.cross_entropy(logits, labels)
         h_norm = F.normalize(human_anchors, dim=1)
         d_norm = F.normalize(dog_protos, dim=1)
         loss_b = (1 - (h_norm * d_norm).sum(1)).mean()
         return loss_a + loss_b
 
-
 class EmergentLoss(nn.Module):
     def forward(self, a, b):
         return 1 - F.cosine_similarity(a, b).mean()
 
-
-# ==================== 严格按你的公式实现 EmergentVAD Loss ====================
 class EmergentVADLoss(nn.Module):
-    """
-    L_EmergentVAD = (1/N) Σ ||ŷ^i - μ_yi||²
-                  + λ_r Σ max(0, δ - (ŷ_dim^{c+} - ŷ_dim^{c-}))
-                  + λ_o Σ_{j≠k} |cos(w_j, w_k)|
-    """
     def __init__(self, lambda_r=2.0, lambda_o=0.2, delta=0.25):
         super().__init__()
         self.lambda_r = lambda_r
         self.lambda_o = lambda_o
         self.delta = delta
 
-        # R: (c^+, c^-, dim)  —— 修复了多余的 7！
-        self.R = [
-            (0, 1, 1), (0, 3, 1), (0, 6, 1),  # Anger > Fear/Anxiety/Discomfort in Arousal
-            (4, 7, 1), (5, 7, 1),              # Playfulness/Happiness > Neutral in Arousal
-            (0, 1, 2),                         # Anger > Fear in Dominance
-            (4, 3, 0), (5, 3, 0),              # Playfulness/Happiness > Anxiety in Valence
+        # (c+, c-, dim, weight) —— Dominance 规则权重×3倍！
+        self.rules = [
+            (0, 1, 1, 1.0), (0, 3, 1, 1.0), (0, 6, 1, 1.0),
+            (4, 7, 1, 1.0), (5, 7, 1, 1.0),
+            (0, 1, 2, 3.0),  # Anger > Fear 在 Dominance 上最重要！
+            (4, 3, 0, 1.0), (5, 3, 0, 1.0),
         ]
 
     def forward(self, y_hat, labels, w):
         N = y_hat.size(0)
 
-        # Term ①: Compactness
+        # ① Compactness（余弦版）
         class_means = torch.zeros(8, 3, device=y_hat.device)
-        for c in range(8):
+        for c in range(0, 8):
             mask = (labels == c)
             if mask.sum() > 0:
-                class_means[c] = y_hat[mask].mean(dim=0)
+                class_means[c] = y_hat[mask].mean(0)
         mu_yi = class_means[labels]
-        loss_compact = F.mse_loss(y_hat, mu_yi)
+        loss_compact = 1 - F.cosine_similarity(y_hat, mu_yi).mean()
 
-        # Term ②: Ranking
+        # ② Ranking（加权）
         loss_rank = 0.0
-        for c_plus, c_minus, dim in self.R:  # 现在是 3 个值，完美解包！
+        total_weight = 0.0
+        for c_plus, c_minus, dim, weight in self.rules:
             diff = class_means[c_plus, dim] - class_means[c_minus, dim]
-            loss_rank += F.relu(self.delta - diff)
-        loss_rank = self.lambda_r * loss_rank / len(self.R)
+            loss_rank += weight * F.relu(self.delta - diff)
+            total_weight += weight
+        loss_rank = self.lambda_r * loss_rank / total_weight
 
-        # Term ③: Orthogonality
-        w_norm = F.normalize(w, dim=1)  # [3, 128]
-        cos_matrix = torch.abs(torch.mm(w_norm, w_norm.t()))  # [3,3]
-        loss_ortho = self.lambda_o * (cos_matrix.sum() - cos_matrix.trace()) / 6  # 3×2=6
+        # ③ Orthogonality
+        w_norm = F.normalize(w, dim=1)
+        cos_matrix = torch.abs(torch.mm(w_norm, w_norm.t()))
+        loss_ortho = self.lambda_o * (cos_matrix.sum() - cos_matrix.trace()) / 6
 
         return loss_compact + loss_rank + loss_ortho

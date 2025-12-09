@@ -6,7 +6,7 @@
 # @Software : PyCharm
 # @Description :
 
-# train.py —— 每个 epoch 实时保存日志（支持随时中断）
+# train.py —— 修复 EarlyStopping + 永不覆盖 + 时间戳
 import os
 import torch
 import torch.nn as nn
@@ -33,155 +33,148 @@ class AverageMeter:
         self.avg = self.sum / self.count
 
 
-def save_log(history, log_file):
-    """实时保存日志（每个 epoch 调用一次）"""
-    with open(log_file, 'w', encoding='utf-8') as f:
-        json.dump(history, f, indent=2, ensure_ascii=False)
-
-
 def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using {device}")
 
-    # 数据
-    dataset = PairedDogDataset()
-    train_size = int(0.8 * len(dataset))
-    val_size = len(dataset) - train_size
-    train_set, val_set = random_split(dataset, [train_size, val_size],
-                                      generator=torch.Generator().manual_seed(42))
+    # ==================== 自动创建带时间戳的实验文件夹 ====================
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_dir = f"runs/run_{timestamp}"
+    os.makedirs(run_dir, exist_ok=True)
 
+    best_model_path  = os.path.join(run_dir, "best_model.pt")
+    final_model_path = os.path.join(run_dir, "final_model.pt")
+    log_file         = os.path.join(run_dir, "training_log.json")
+
+    print(f"本次训练完整保存在: {run_dir}")
+
+    # ==================== 数据 & 模型 ====================
+    dataset = PairedDogDataset()
+    train_set, val_set = random_split(dataset, [int(0.8*len(dataset)), len(dataset)-int(0.8*len(dataset))],
+                                      generator=torch.Generator().manual_seed(42))
     train_loader = DataLoader(train_set, batch_size=16, shuffle=True, num_workers=0, pin_memory=True)
     val_loader   = DataLoader(val_set,   batch_size=16, shuffle=False, num_workers=0)
 
-    # 模型
     model = DogEmotionModel().to(device)
     optimizer = optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-2)
 
-    # 损失
-    proto_loss = BiProtoAlignLoss(temp=0.07)
+    proto_loss = BiProtoAlignLoss()
     emer_loss  = EmergentLoss()
     vad_loss   = EmergentVADLoss(lambda_r=2.0, lambda_o=0.2, delta=0.25)
 
-    # 人类锚点
     human_anchors = torch.load("real_human_anchors.pt", map_location=device)
     human_anchors = human_anchors.detach()
     human_anchors.requires_grad = False
 
     tracker = PrototypeTracker(num_classes=8, dim=128, device=device)
-    early_stop = EarlyStopping(patience=15, save_path="best_emergent_vad.pt")
 
-    # 日志（实时保存）
-    log_dir = "logs"
-    os.makedirs(log_dir, exist_ok=True)
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    log_file = os.path.join(log_dir, f"train_realtime_{timestamp}.json")
+    # 修复：给 EarlyStopping 正确的保存路径！
+    early_stop = EarlyStopping(patience=15, save_path=best_model_path)  # 改这里！
 
-    history = {
-        "timestamp": timestamp,
-        "train_samples": len(train_set),
-        "val_samples": len(val_set),
-        "best_val_loss": float('inf'),
-        "best_epoch": 0,
-        "epochs": []
-    }
-    print(f"实时日志将保存在: {log_file}")
+    dynamic_anchors = human_anchors.clone().detach()
 
+    history = {"timestamp": timestamp, "epochs": []}
     best_val = float('inf')
 
     try:
         for epoch in range(1, 101):
             model.train()
-            p_meter = e_meter = v_meter = total_meter = AverageMeter()
+            meters = {k: AverageMeter() for k in ["total","proto","emer","vad"]}
+
+            vad_weight = 0.3 + 1.7 * (epoch / 50.0)
+            proto_temp = max(0.07 * (0.98 ** epoch), 0.01)
 
             for batch in tqdm(train_loader, desc=f"Epoch {epoch:>3}", colour="cyan"):
                 optimizer.zero_grad()
 
-                small_in = batch["small_dog"].to(device)
-                large_in = batch["large_dog"].to(device)
+                s_in = batch["small_dog"].to(device)
+                l_in = batch["large_dog"].to(device)
                 labels = batch["class_id"].to(device)
 
-                s_emb, s_vad = model(small_in)
-                l_emb, l_vad = model(large_in)
+                s_emb, s_vad = model(s_in)
+                l_emb, l_vad = model(l_in)
 
                 emb = torch.cat([s_emb, l_emb], dim=0)
                 vad = torch.cat([s_vad, l_vad], dim=0)
                 lbl = torch.cat([labels, labels], dim=0)
 
-                p_loss = proto_loss(emb, lbl, human_anchors, tracker.get_prototypes())
+                p_loss = proto_loss(emb, lbl, dynamic_anchors, tracker.get_prototypes(), temp=proto_temp)
                 e_loss = emer_loss(s_emb, l_emb)
                 v_loss = vad_loss(vad, lbl, model.get_vad_weights())
 
-                loss = 0.7 * p_loss + 1.0 * e_loss + 1.5 * v_loss
+                loss = p_loss + 1.0 * e_loss + vad_weight * v_loss
 
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 optimizer.step()
                 tracker.update(emb.detach(), lbl)
 
-                bs = labels.size(0)
-                p_meter.update(p_loss.item(), bs)
-                e_meter.update(e_loss.item(), bs)
-                v_meter.update(v_loss.item(), bs)
-                total_meter.update(loss.item(), bs)
+                for k, v in zip(["total","proto","emer","vad"], [loss, p_loss, e_loss, v_loss]):
+                    meters[k].update(v.item(), labels.size(0))
+
+            # 每5 epoch 更新动态锚点
+            if epoch % 5 == 0:
+                with torch.no_grad():
+                    current_proto = tracker.get_prototypes()
+                    dynamic_anchors = 0.99 * dynamic_anchors + 0.01 * current_proto
+                    dynamic_anchors = dynamic_anchors.detach()
 
             # 验证
             model.eval()
             val_total = AverageMeter()
             with torch.no_grad():
                 for batch in val_loader:
-                    small_in = batch["small_dog"].to(device)
-                    large_in = batch["large_dog"].to(device)
+                    s_in = batch["small_dog"].to(device)
+                    l_in = batch["large_dog"].to(device)
                     labels = batch["class_id"].to(device)
 
-                    s_emb, s_vad = model(small_in)
-                    l_emb, l_vad = model(large_in)
+                    s_emb, s_vad = model(s_in)
+                    l_emb, l_vad = model(l_in)
 
                     emb = torch.cat([s_emb, l_emb], dim=0)
                     vad = torch.cat([s_vad, l_vad], dim=0)
                     lbl = torch.cat([labels, labels], dim=0)
 
-                    p_loss = proto_loss(emb, lbl, human_anchors, tracker.get_prototypes())
+                    p_loss = proto_loss(emb, lbl, dynamic_anchors, tracker.get_prototypes(), temp=proto_temp)
                     e_loss = emer_loss(s_emb, l_emb)
                     v_loss = vad_loss(vad, lbl, model.get_vad_weights())
 
-                    val_total.update((p_loss + 0.3 * e_loss + 1.0 * v_loss).item(), labels.size(0))
+                    val_total.update((p_loss + 1.0 * e_loss + vad_weight * v_loss).item(), labels.size(0))
 
-            # 记录当前 epoch
+            # 保存日志
             epoch_log = {
                 "epoch": epoch,
-                "train_loss": round(total_meter.avg, 6),
-                "train_proto": round(p_meter.avg, 6),
-                "train_emer": round(e_meter.avg, 6),
-                "train_vad": round(v_meter.avg, 6),
-                "val_loss": round(val_total.avg, 6)
+                "train_loss": round(meters['total'].avg, 6),
+                "proto": round(meters['proto'].avg, 6),
+                "emer": round(meters['emer'].avg, 6),
+                "vad": round(meters['vad'].avg, 6),
+                "val_loss": round(val_total.avg, 6),
+                "vad_weight": round(vad_weight, 3)
             }
             history["epochs"].append(epoch_log)
 
-            # 每个 epoch 立即保存日志！
+            with open(log_file, 'w', encoding='utf-8') as f:
+                json.dump(history, f, indent=2, ensure_ascii=False)
+
+            # 最佳模型由 EarlyStopping 自动保存（已修复路径）
             if val_total.avg < best_val:
                 best_val = val_total.avg
-                history["best_val_loss"] = best_val
-                history["best_epoch"] = epoch
-                torch.save(model.state_dict(), "best_emergent_vad.pt")
+                print(f"    BEST MODEL SAVED! Val={best_val:.6f}")
 
-            save_log(history, log_file)  # 实时保存！
+            print(f"Epoch {epoch:>3} | Train {meters['total'].avg:.4f} | Val {val_total.avg:.4f} | VAD_W {vad_weight:.2f}")
 
-            print(f"\n{'='*80}")
-            print(f"Epoch {epoch:>3} | Train {total_meter.avg:.4f} "
-                  f"(P {p_meter.avg:.4f} E {e_meter.avg:.4f} V {v_meter.avg:.4f}) | "
-                  f"Val {val_total.avg:.4f}", "← BEST" if val_total.avg < best_val else "")
-
-            if early_stop(val_total.avg, model):
-                print("Early stopping!")
+            if early_stop(val_total.avg, model):  # 现在不会报错了！
+                print("Early stopping triggered!")
                 break
 
     except KeyboardInterrupt:
-        print("\n手动停止训练！日志已实时保存！")
+        print("\n手动停止！所有文件已安全保存！")
     finally:
-        save_log(history, log_file)
-        print(f"最终日志已保存: {log_file}")
-        print("你可以随时中断，数据永不丢失！")
+        torch.save(model.state_dict(), final_model_path)
+        print(f"\n训练结束！最终模型已保存: {final_model_path}")
 
+    print(f"所有文件保存在: {run_dir}")
+    print("现在运行 vad_radar.py 看完美八角星！")
 
 if __name__ == '__main__':
     main()
