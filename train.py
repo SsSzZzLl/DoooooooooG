@@ -6,7 +6,7 @@
 # @Software : PyCharm
 # @Description :
 
-# train.py —— 修复 EarlyStopping + 永不覆盖 + 时间戳
+# train.py
 import os
 import torch
 import torch.nn as nn
@@ -15,6 +15,7 @@ from torch.utils.data import DataLoader, random_split
 from tqdm import tqdm
 import json
 from datetime import datetime
+import torch.nn.functional as F
 
 from src.dataset import PairedDogDataset
 from src.model import DogEmotionModel
@@ -37,51 +38,78 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using {device}")
 
-    # ==================== 自动创建带时间戳的实验文件夹 ====================
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    run_dir = f"runs/run_{timestamp}"
-    os.makedirs(run_dir, exist_ok=True)
+    # ==================== 消融实验支持（通过环境变量控制）===================
+    ABLATION_MODE = os.getenv("ABLATION_MODE", "full")  # full / no_vad / no_proto / random_anchor
+    RUN_DIR = os.getenv("RUN_DIR")  # 消融时强制指定保存目录
+    VAD_WEIGHT_STR = os.getenv("VAD_WEIGHT", "0.3 + 1.7 * (epoch / 50.0)")
+    USE_PROTO = os.getenv("USE_PROTO", "True") == "True"
+    USE_VAD = os.getenv("USE_VAD", "True") == "True"
+    ANCHOR_TYPE = os.getenv("ANCHOR_TYPE", "human")  # human / random
 
-    best_model_path  = os.path.join(run_dir, "best_model.pt")
+    print(f"【消融模式】: {ABLATION_MODE}")
+    print(f"Proto: {USE_PROTO} | VAD: {USE_VAD} | Anchor: {ANCHOR_TYPE}")
+
+    # ==================== 自动创建实验目录（支持强制指定 RUN_DIR）===================
+    if RUN_DIR:
+        run_dir = RUN_DIR
+        os.makedirs(run_dir, exist_ok=True)
+    else:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        run_dir = f"runs/run_{timestamp}"
+        os.makedirs(run_dir, exist_ok=True)
+
+    best_model_path = os.path.join(run_dir, "best_model.pt")
     final_model_path = os.path.join(run_dir, "final_model.pt")
-    log_file         = os.path.join(run_dir, "training_log.json")
+    log_file = os.path.join(run_dir, "training_log.json")
 
-    print(f"本次训练完整保存在: {run_dir}")
+    print(f"实验保存目录: {run_dir}\n")
 
-    # ==================== 数据 & 模型 ====================
+    # ==================== 数据加载 ====================
     dataset = PairedDogDataset()
-    train_set, val_set = random_split(dataset, [int(0.8*len(dataset)), len(dataset)-int(0.8*len(dataset))],
-                                      generator=torch.Generator().manual_seed(42))
+    train_set, val_set = random_split(
+        dataset, [int(0.8*len(dataset)), len(dataset)-int(0.8*len(dataset))],
+        generator=torch.Generator().manual_seed(42)
+    )
     train_loader = DataLoader(train_set, batch_size=16, shuffle=True, num_workers=0, pin_memory=True)
-    val_loader   = DataLoader(val_set,   batch_size=16, shuffle=False, num_workers=0)
+    val_loader = DataLoader(val_set, batch_size=16, shuffle=False, num_workers=0)
 
+    # ==================== 模型与优化器 ====================
     model = DogEmotionModel().to(device)
     optimizer = optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-2)
 
-    proto_loss = BiProtoAlignLoss()
-    emer_loss  = EmergentLoss()
-    vad_loss   = EmergentVADLoss(lambda_r=2.0, lambda_o=0.2, delta=0.25)
+    proto_loss_fn = BiProtoAlignLoss()
+    emer_loss_fn = EmergentLoss()
+    vad_loss_fn = EmergentVADLoss(lambda_r=2.0, lambda_o=0.2, delta=0.25)
 
-    human_anchors = torch.load("real_human_anchors.pt", map_location=device)
+    # ==================== 人类锚点（支持随机锚点消融）===================
+    if ANCHOR_TYPE == "random":
+        print("警告: 使用随机人类锚点（消融实验）")
+        human_anchors = torch.randn(8, 128, device=device)
+        human_anchors = F.normalize(human_anchors, dim=1)
+    else:
+        human_anchors = torch.load("real_human_anchors.pt", map_location=device)
+
     human_anchors = human_anchors.detach()
     human_anchors.requires_grad = False
 
     tracker = PrototypeTracker(num_classes=8, dim=128, device=device)
-
-    # 修复：给 EarlyStopping 正确的保存路径！
-    early_stop = EarlyStopping(patience=15, save_path=best_model_path)  # 改这里！
+    early_stop = EarlyStopping(patience=5, save_path=best_model_path)
 
     dynamic_anchors = human_anchors.clone().detach()
 
-    history = {"timestamp": timestamp, "epochs": []}
+    history = {
+        "timestamp": datetime.now().isoformat(),
+        "mode": ABLATION_MODE,
+        "epochs": []
+    }
     best_val = float('inf')
 
     try:
         for epoch in range(1, 101):
             model.train()
-            meters = {k: AverageMeter() for k in ["total","proto","emer","vad"]}
+            meters = {k: AverageMeter() for k in ["total", "proto", "emer", "vad"]}
 
-            vad_weight = 0.3 + 1.7 * (epoch / 50.0)
+            vad_weight = eval(VAD_WEIGHT_STR)
             proto_temp = max(0.07 * (0.98 ** epoch), 0.01)
 
             for batch in tqdm(train_loader, desc=f"Epoch {epoch:>3}", colour="cyan"):
@@ -98,9 +126,13 @@ def main():
                 vad = torch.cat([s_vad, l_vad], dim=0)
                 lbl = torch.cat([labels, labels], dim=0)
 
-                p_loss = proto_loss(emb, lbl, dynamic_anchors, tracker.get_prototypes(), temp=proto_temp)
-                e_loss = emer_loss(s_emb, l_emb)
-                v_loss = vad_loss(vad, lbl, model.get_vad_weights())
+                # Proto Loss（可消融）
+                p_loss = proto_loss_fn(emb, lbl, dynamic_anchors, tracker.get_prototypes(), temp=proto_temp) if USE_PROTO else torch.tensor(0.0, device=device)
+
+                e_loss = emer_loss_fn(s_emb, l_emb)
+
+                # VAD Loss（可消融）
+                v_loss = vad_loss_fn(vad, lbl, model.get_vad_weights()) if USE_VAD else torch.tensor(0.0, device=device)
 
                 loss = p_loss + 1.0 * e_loss + vad_weight * v_loss
 
@@ -119,7 +151,7 @@ def main():
                     dynamic_anchors = 0.99 * dynamic_anchors + 0.01 * current_proto
                     dynamic_anchors = dynamic_anchors.detach()
 
-            # 验证
+            # ==================== 验证 ====================
             model.eval()
             val_total = AverageMeter()
             with torch.no_grad():
@@ -135,13 +167,13 @@ def main():
                     vad = torch.cat([s_vad, l_vad], dim=0)
                     lbl = torch.cat([labels, labels], dim=0)
 
-                    p_loss = proto_loss(emb, lbl, dynamic_anchors, tracker.get_prototypes(), temp=proto_temp)
-                    e_loss = emer_loss(s_emb, l_emb)
-                    v_loss = vad_loss(vad, lbl, model.get_vad_weights())
+                    p_loss = proto_loss_fn(emb, lbl, dynamic_anchors, tracker.get_prototypes(), temp=proto_temp) if USE_PROTO else 0.0
+                    e_loss = emer_loss_fn(s_emb, l_emb)
+                    v_loss = vad_loss_fn(vad, lbl, model.get_vad_weights()) if USE_VAD else 0.0
 
                     val_total.update((p_loss + 1.0 * e_loss + vad_weight * v_loss).item(), labels.size(0))
 
-            # 保存日志
+            # ==================== 日志记录 ====================
             epoch_log = {
                 "epoch": epoch,
                 "train_loss": round(meters['total'].avg, 6),
@@ -156,25 +188,24 @@ def main():
             with open(log_file, 'w', encoding='utf-8') as f:
                 json.dump(history, f, indent=2, ensure_ascii=False)
 
-            # 最佳模型由 EarlyStopping 自动保存（已修复路径）
             if val_total.avg < best_val:
                 best_val = val_total.avg
                 print(f"    BEST MODEL SAVED! Val={best_val:.6f}")
 
-            print(f"Epoch {epoch:>3} | Train {meters['total'].avg:.4f} | Val {val_total.avg:.4f} | VAD_W {vad_weight:.2f}")
+            print(f"Epoch {epoch:>3} | Train {meters['total'].avg:.4f} | Val {val_total.avg:.4f}")
 
-            if early_stop(val_total.avg, model):  # 现在不会报错了！
-                print("Early stopping triggered!")
+            if early_stop(val_total.avg, model):
+                print("Early stopping!")
                 break
 
     except KeyboardInterrupt:
-        print("\n手动停止！所有文件已安全保存！")
+        print("\n手动停止训练！")
     finally:
         torch.save(model.state_dict(), final_model_path)
-        print(f"\n训练结束！最终模型已保存: {final_model_path}")
-
-    print(f"所有文件保存在: {run_dir}")
-    print("现在运行 vad_radar.py 看完美八角星！")
+        print(f"\n训练完成！")
+        print(f"最佳模型: {best_model_path}")
+        print(f"最终模型: {final_model_path}")
+        print(f"日志: {log_file}")
 
 if __name__ == '__main__':
     main()

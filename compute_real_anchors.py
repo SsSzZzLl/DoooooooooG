@@ -89,8 +89,8 @@ for i in range(8):
     else:
         print(f"警告：类别 {i} 无样本，使用零向量")
 
-# 6. 投影到 128 维（修复设备问题！）
-projector = torch.nn.Linear(768, 128).to(device)  # projector 必须在 device 上！
+# 6. 投影到 128 维
+projector = torch.nn.Linear(768, 128).to(device)
 torch.nn.init.xavier_uniform_(projector.weight)
 human_anchors = projector(proto_tensor.to(device)).cpu().detach()
 

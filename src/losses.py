@@ -6,10 +6,15 @@
 # @Software : PyCharm
 # @Description : 
 
-# src/losses.py
+# src/losses.py —— 支持消融实验的完整版
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import os
+
+# 全局消融开关（由 train.py 注入）
+USE_VAD_GLOBAL = os.getenv("USE_VAD", "True") == "True"
+
 
 class BiProtoAlignLoss(nn.Module):
     def __init__(self):
@@ -23,9 +28,11 @@ class BiProtoAlignLoss(nn.Module):
         loss_b = (1 - (h_norm * d_norm).sum(1)).mean()
         return loss_a + loss_b
 
+
 class EmergentLoss(nn.Module):
     def forward(self, a, b):
         return 1 - F.cosine_similarity(a, b).mean()
+
 
 class EmergentVADLoss(nn.Module):
     def __init__(self, lambda_r=2.0, lambda_o=0.2, delta=0.25):
@@ -34,27 +41,30 @@ class EmergentVADLoss(nn.Module):
         self.lambda_o = lambda_o
         self.delta = delta
 
-        # (c+, c-, dim, weight) —— Dominance 规则权重×3倍！
         self.rules = [
-            (0, 1, 1, 1.0), (0, 3, 1, 1.0), (0, 6, 1, 1.0),
-            (4, 7, 1, 1.0), (5, 7, 1, 1.0),
-            (0, 1, 2, 3.0),  # Anger > Fear 在 Dominance 上最重要！
-            (4, 3, 0, 1.0), (5, 3, 0, 1.0),
+            (0,1,1,1.0), (0,3,1,1.0), (0,6,1,1.0),
+            (4,7,1,1.0), (5,7,1,1.0),
+            (0,1,2,3.0),  # Dominance 权重×3
+            (4,3,0,1.0), (5,3,0,1.0),
         ]
 
     def forward(self, y_hat, labels, w):
+        # 消融开关：如果禁用 VAD，直接返回 0
+        if not USE_VAD_GLOBAL:
+            return torch.tensor(0.0, device=y_hat.device, requires_grad=True)
+
         N = y_hat.size(0)
 
-        # ① Compactness（余弦版）
+        # Compactness（余弦版）
         class_means = torch.zeros(8, 3, device=y_hat.device)
-        for c in range(0, 8):
+        for c in range(8):
             mask = (labels == c)
             if mask.sum() > 0:
                 class_means[c] = y_hat[mask].mean(0)
         mu_yi = class_means[labels]
         loss_compact = 1 - F.cosine_similarity(y_hat, mu_yi).mean()
 
-        # ② Ranking（加权）
+        # Ranking（加权 hinge）
         loss_rank = 0.0
         total_weight = 0.0
         for c_plus, c_minus, dim, weight in self.rules:
@@ -63,7 +73,7 @@ class EmergentVADLoss(nn.Module):
             total_weight += weight
         loss_rank = self.lambda_r * loss_rank / total_weight
 
-        # ③ Orthogonality
+        # Orthogonality
         w_norm = F.normalize(w, dim=1)
         cos_matrix = torch.abs(torch.mm(w_norm, w_norm.t()))
         loss_ortho = self.lambda_o * (cos_matrix.sum() - cos_matrix.trace()) / 6
