@@ -1,0 +1,33 @@
+
+full:
+  name: "full"
+  use_proto: true
+  use_vad: true
+  anchor_type: "human"
+
+no_vad:
+  name: "no_vad"
+  use_proto: true
+  use_vad: false
+  anchor_type: "human"
+
+no_proto:
+  name: "no_proto"
+  use_proto: false
+  use_vad: true
+  anchor_type: "human"
+
+random_anchor:
+  name: "random_anchor"
+  use_proto: true
+  use_vad: true
+  anchor_type: "random"
+
+global:
+  train_batch_size: 8
+  infer_batch_size: 32
+  val_batch_size: 16
+  early_stop_patience: 5
+  max_epochs: 50
+  lr: 0.0001
+  seed: 42

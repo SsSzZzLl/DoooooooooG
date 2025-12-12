@@ -15,9 +15,23 @@ from torch.utils.data import Dataset
 from transformers import Wav2Vec2Processor
 
 class PairedDogDataset(Dataset):
-    def __init__(self, original_root="data/Mescalina 2017", augmented_root="data/Mescalina 2017_augmented"):
-        self.original_root = original_root.rstrip("/")
-        self.augmented_root = augmented_root.rstrip("/")
+    def __init__(self):
+        # 正确计算项目根目录
+        current_dir = os.path.dirname(os.path.abspath(__file__))  # src
+        parent_dir = os.path.dirname(current_dir)  # E:\DoooooooooG
+        self.original_root = os.path.join(parent_dir, "data", "Mescalina_2017")
+        self.augmented_root = os.path.join(parent_dir, "data", "Mescalina_2017_augmented")  # ← 去掉空格！
+
+        print(f"原始数据目录: {self.original_root}")
+        print(f"增强数据目录: {self.augmented_root}")
+
+        if not os.path.exists(self.original_root):
+            raise FileNotFoundError(f"原始数据目录不存在！请放到: {self.original_root}")
+        if not os.path.exists(self.augmented_root):
+            print("检测到增强数据，将使用增强版本")
+        else:
+            print("未检测到增强数据，只使用原始数据")
+
         self.processor = Wav2Vec2Processor.from_pretrained("facebook/wav2vec2-base-960h")
         self.max_len = 16000 * 3
 

@@ -15,8 +15,8 @@ from tqdm import tqdm
 from joblib import Parallel, delayed
 import multiprocessing
 
-INPUT_ROOT = "../data/Mescalina 2017"
-OUTPUT_ROOT = "../data/Mescalina 2017_augmented"
+INPUT_ROOT = "../data/Mescalina_2017"
+OUTPUT_ROOT = "../data/Mescalina_2017_augmented"
 EXTENSIONS = ('.wav', '.mp3', '.flac', '.ogg')
 PITCH_SHIFT_MIN = -4.5
 PITCH_SHIFT_MAX = -2.0

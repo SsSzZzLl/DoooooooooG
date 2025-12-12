@@ -6,15 +6,10 @@
 # @Software : PyCharm
 # @Description : 
 
-# src/losses.py —— 支持消融实验的完整版
+# src/losses.py
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import os
-
-# 全局消融开关（由 train.py 注入）
-USE_VAD_GLOBAL = os.getenv("USE_VAD", "True") == "True"
-
 
 class BiProtoAlignLoss(nn.Module):
     def __init__(self):
@@ -28,11 +23,9 @@ class BiProtoAlignLoss(nn.Module):
         loss_b = (1 - (h_norm * d_norm).sum(1)).mean()
         return loss_a + loss_b
 
-
 class EmergentLoss(nn.Module):
     def forward(self, a, b):
         return 1 - F.cosine_similarity(a, b).mean()
-
 
 class EmergentVADLoss(nn.Module):
     def __init__(self, lambda_r=2.0, lambda_o=0.2, delta=0.25):
@@ -49,13 +42,9 @@ class EmergentVADLoss(nn.Module):
         ]
 
     def forward(self, y_hat, labels, w):
-        # 消融开关：如果禁用 VAD，直接返回 0
-        if not USE_VAD_GLOBAL:
-            return torch.tensor(0.0, device=y_hat.device, requires_grad=True)
-
         N = y_hat.size(0)
 
-        # Compactness（余弦版）
+        # Compactness
         class_means = torch.zeros(8, 3, device=y_hat.device)
         for c in range(8):
             mask = (labels == c)
@@ -64,7 +53,7 @@ class EmergentVADLoss(nn.Module):
         mu_yi = class_means[labels]
         loss_compact = 1 - F.cosine_similarity(y_hat, mu_yi).mean()
 
-        # Ranking（加权 hinge）
+        # Ranking
         loss_rank = 0.0
         total_weight = 0.0
         for c_plus, c_minus, dim, weight in self.rules:
